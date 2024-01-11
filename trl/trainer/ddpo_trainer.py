@@ -15,13 +15,17 @@
 import os
 from collections import defaultdict
 from concurrent import futures
-from typing import Any, Callable, Optional, Tuple
+from functools import partial
+from typing import Any, Callable, Optional, Tuple, Union
 from warnings import warn
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
+import tqdm
+tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 from ..models import DDPOStableDiffusionPipeline
 from . import BaseTrainer, DDPOConfig
@@ -49,7 +53,7 @@ class DDPOTrainer(BaseTrainer):
     def __init__(
         self,
         config: DDPOConfig,
-        reward_function: Callable[[torch.Tensor, Tuple[str], Tuple[Any]], torch.Tensor],
+        reward_function: Union[Callable[[torch.Tensor, Tuple[str], Tuple[Any]], torch.Tensor], str],
         prompt_function: Callable[[], Tuple[str, Any]],
         sd_pipeline: DDPOStableDiffusionPipeline,
         image_samples_hook: Optional[Callable[[Any, Any, Any], Any]] = None,
@@ -62,6 +66,13 @@ class DDPOTrainer(BaseTrainer):
         self.config = config
         self.image_samples_callback = image_samples_hook
 
+        total_batch_size = (
+            self.config.train_batch_size * torch.cuda.device_count() *
+            self.config.train_gradient_accumulation_steps
+        )
+        exp_dir = f'b{total_batch_size}_lr{self.config.train_learning_rate}'
+        project_dir = self.config.project_kwargs['project_dir']
+        self.config.project_kwargs['project_dir'] = os.path.join(project_dir, exp_dir)
         accelerator_project_config = ProjectConfiguration(**self.config.project_kwargs)
 
         if self.config.resume_from:
@@ -217,11 +228,11 @@ class DDPOTrainer(BaseTrainer):
 
         Returns:
             global_step (int): The updated global step.
-
         """
         samples, prompt_image_data = self._generate_samples(
             iterations=self.config.sample_num_batches_per_epoch,
             batch_size=self.config.sample_batch_size,
+            epoch=epoch,
         )
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
@@ -238,6 +249,8 @@ class DDPOTrainer(BaseTrainer):
 
         rewards = torch.cat(rewards)
         rewards = self.accelerator.gather(rewards).cpu().numpy()
+        if self.accelerator.is_main_process:
+            print(f'Epoch {epoch}: avg. reward: {np.mean(rewards)}')
 
         self.accelerator.log(
             {
@@ -414,13 +427,14 @@ class DDPOTrainer(BaseTrainer):
         self.sd_pipeline.load_checkpoint(models, input_dir)
         models.pop()  # ensures that accelerate doesn't try to handle loading of the model
 
-    def _generate_samples(self, iterations, batch_size):
+    def _generate_samples(self, iterations, batch_size, epoch):
         """
         Generate samples from the model
 
         Args:
             iterations (int): Number of iterations to generate samples for
             batch_size (int): Batch size to use for sampling
+            epoch (int): Current epoch
 
         Returns:
             samples (List[Dict[str, torch.Tensor]]), prompt_image_pairs (List[List[Any]])
@@ -431,7 +445,12 @@ class DDPOTrainer(BaseTrainer):
 
         sample_neg_prompt_embeds = self.neg_prompt_embed.repeat(batch_size, 1, 1)
 
-        for _ in range(iterations):
+        for _ in tqdm(
+            range(iterations),
+            desc=f"Epoch {epoch}: sampling",
+            disable=not self.accelerator.is_local_main_process,
+            position=0,
+        ):
             prompts, prompt_metadata = zip(*[self.prompt_fn() for _ in range(batch_size)])
 
             prompt_ids = self.sd_pipeline.tokenizer(
@@ -494,7 +513,12 @@ class DDPOTrainer(BaseTrainer):
             global_step (int): The updated global step
         """
         info = defaultdict(list)
-        for i, sample in enumerate(batched_samples):
+        for i, sample in tqdm(
+            enumerate(batched_samples),
+            desc=f"Epoch {epoch}.{inner_epoch}: training",
+            position=0,
+            disable=not self.accelerator.is_local_main_process,
+        ):
             if self.config.train_cfg:
                 # concat negative prompts to sample prompts to avoid two forward passes
                 embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
@@ -569,6 +593,9 @@ class DDPOTrainer(BaseTrainer):
         global_step = 0
         if epochs is None:
             epochs = self.config.num_epochs
+        # Save the pre-trained weights.
+        if self.first_epoch == 0 and self.accelerator.is_main_process:
+            self.accelerator.save_state()
         for epoch in range(self.first_epoch, epochs):
             global_step = self.step(epoch, global_step)
 
